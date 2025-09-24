@@ -1,0 +1,11 @@
+﻿__pycache__/
+*.py[cod]
+*.log
+.env
+.env.*
+.venv/
+venv/
+news_post_history.jsonl
+fun_facts_history.json
+fun_facts_history.jsonl
+.DS_Store

@@ -1,0 +1,662 @@
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
+import requests
+from dotenv import load_dotenv
+from openai import OpenAI
+import tweepy
+
+
+DEFAULT_INTERVAL_SECONDS = 30 * 60  # 30 minutes
+SUMMARY_CHAR_LIMITS = [240, 220, 200, 180, 160, 140]
+MAX_SUMMARY_ATTEMPTS = len(SUMMARY_CHAR_LIMITS)
+MAX_TWEET_LENGTH = 280
+NEWS_API_ENDPOINT = "https://newsapi.org/v2/top-headlines"
+DEFAULT_HISTORY_PATH = "news_post_history.jsonl"
+VALID_NEWSAPI_COUNTRIES = {
+    "ae", "ar", "at", "au", "be", "bg", "br", "ca", "ch", "cn", "co", "cu",
+    "cz", "de", "eg", "fr", "gb", "gr", "hk", "hu", "id", "ie", "il", "in",
+    "it", "jp", "kr", "lt", "lv", "ma", "mx", "my", "ng", "nl", "no", "nz",
+    "ph", "pl", "pt", "ro", "rs", "ru", "sa", "se", "sg", "si", "sk", "th",
+    "tr", "tw", "ua", "us", "ve", "za"
+}
+REGION_COUNTRY_MAP: Dict[str, List[str]] = {
+    "europe": ["gb", "fr", "de", "it", "es", "nl", "se", "pl"],
+    "asia": ["jp", "sg", "in", "cn", "kr", "hk", "th"],
+    "north_america": ["us", "ca", "mx"],
+    "south_america": ["br", "ar", "co"],
+    "oceania": ["au", "nz"],
+    "middle_east": ["ae", "sa", "il", "tr", "eg"],
+    "africa": ["za", "ng", "ke", "ma"],
+}
+DEFAULT_HASHTAGS = ["#News", "#TopStories"]
+CATEGORY_HASHTAGS: Dict[str, List[str]] = {
+    "business": ["#Business", "#Markets"],
+    "finance": ["#Finance", "#Markets"],
+    "economy": ["#Economy", "#Markets"],
+    "technology": ["#TechNews", "#Innovation"],
+    "tech": ["#TechNews", "#Innovation"],
+    "ai": ["#AI", "#TechNews"],
+    "science": ["#Science", "#Research"],
+    "health": ["#Health", "#Wellness"],
+    "sports": ["#Sports", "#GameDay"],
+    "sport": ["#Sports", "#GameDay"],
+    "entertainment": ["#Entertainment", "#PopCulture"],
+    "culture": ["#Culture", "#Entertainment"],
+    "politics": ["#Politics", "#Government"],
+    "world": ["#WorldNews", "#Global"],
+    "climate": ["#Climate", "#Environment"],
+    "environment": ["#Environment", "#Climate"],
+    "energy": ["#Energy", "#Sustainability"],
+    "travel": ["#Travel", "#Destinations"],
+    "lifestyle": ["#Lifestyle", "#Culture"],
+    "gaming": ["#Gaming", "#Esports"],
+}
+COUNTRY_HASHTAGS: Dict[str, str] = {
+    "us": "#USNews",
+    "ca": "#CanadaNews",
+    "mx": "#MexicoNews",
+    "gb": "#UKNews",
+    "uk": "#UKNews",
+    "fr": "#FranceNews",
+    "de": "#GermanyNews",
+    "it": "#ItalyNews",
+    "es": "#SpainNews",
+    "nl": "#NetherlandsNews",
+    "se": "#SwedenNews",
+    "pl": "#PolandNews",
+    "jp": "#JapanNews",
+    "sg": "#SingaporeNews",
+    "cn": "#ChinaNews",
+    "kr": "#KoreaNews",
+    "hk": "#HongKongNews",
+    "th": "#ThailandNews",
+    "in": "#IndiaNews",
+    "au": "#AustraliaNews",
+    "nz": "#NewZealandNews",
+    "br": "#BrazilNews",
+    "ar": "#ArgentinaNews",
+    "co": "#ColombiaNews",
+    "ae": "#UAEnews",
+    "sa": "#SaudiNews",
+    "il": "#IsraelNews",
+    "tr": "#TurkeyNews",
+    "eg": "#EgyptNews",
+    "za": "#SouthAfricaNews",
+    "ng": "#NigeriaNews",
+    "ke": "#KenyaNews",
+    "ma": "#MoroccoNews",
+    "europe": "#EuropeNews",
+    "asia": "#AsiaNews",
+    "north_america": "#NorthAmericaNews",
+    "south_america": "#SouthAmericaNews",
+    "oceania": "#OceaniaNews",
+    "middle_east": "#MiddleEastNews",
+    "africa": "#AfricaNews",
+}
+KEYWORD_HINTS: Dict[str, List[str]] = {
+    "technology": ["tech", "ai", "artificial intelligence", "software", "cyber", "startup", "robot", "app", "semiconductor", "gadget"],
+    "ai": ["ai", "artificial intelligence", "machine learning", "neural"],
+    "business": ["market", "economy", "company", "earnings", "stock", "deal", "revenue", "merger", "ipo", "acquisition"],
+    "finance": ["bank", "treasury", "loan", "interest rate", "bond", "fed"],
+    "sports": ["championship", "league", "match", "tournament", "player", "coach", "season", "game"],
+    "health": ["health", "vaccine", "medical", "disease", "hospital", "covid", "therapy"],
+    "science": ["research", "astronomy", "space", "scientist", "study", "experiment", "nasa", "discovery"],
+    "entertainment": ["film", "movie", "music", "celebrity", "show", "streaming", "series"],
+    "politics": ["election", "policy", "government", "senate", "parliament", "president", "prime minister", "bill"],
+    "world": ["diplomatic", "conflict", "international", "global", "summit", "war", "peace talks"],
+    "climate": ["climate", "emissions", "carbon", "warming", "sustainability"],
+    "energy": ["energy", "oil", "gas", "renewable", "power plant"],
+}
+NEWSAPI_CATEGORIES = {
+    "business",
+    "entertainment",
+    "general",
+    "health",
+    "science",
+    "sports",
+    "technology",
+}
+CATEGORY_ALIAS_MAP: Dict[str, Tuple[str, str]] = {
+    "business": ("business", "business"),
+    "finance": ("business", "finance"),
+    "markets": ("business", "finance"),
+    "economy": ("business", "economy"),
+    "technology": ("technology", "technology"),
+    "tech": ("technology", "technology"),
+    "ai": ("technology", "ai"),
+    "science": ("science", "science"),
+    "climate": ("science", "climate"),
+    "environment": ("science", "environment"),
+    "health": ("health", "health"),
+    "sports": ("sports", "sports"),
+    "sport": ("sports", "sports"),
+    "entertainment": ("entertainment", "entertainment"),
+    "culture": ("entertainment", "culture"),
+    "gaming": ("entertainment", "gaming"),
+    "politics": ("general", "politics"),
+    "world": ("general", "world"),
+    "news": ("general", "world"),
+    "travel": ("general", "travel"),
+    "lifestyle": ("general", "lifestyle"),
+    "general": ("general", "world"),
+}
+
+
+def configure_logging() -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)s | %(message)s",
+    )
+
+
+def load_history(path: Path) -> Set[str]:
+    if not path.exists():
+        return set()
+
+    identifiers: Set[str] = set()
+    try:
+        with path.open("r", encoding="utf-8") as fp:
+            for line in fp:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    logging.warning("Skipping malformed history line: %s", line)
+                    continue
+
+                identifier = (
+                    entry.get("identifier")
+                    or entry.get("article_url")
+                    or entry.get("fact")
+                    or entry.get("tweet")
+                )
+                if not identifier:
+                    continue
+                identifiers.add(normalise_identifier(str(identifier)))
+    except OSError as exc:
+        logging.warning("Failed to read history %s: %s", path, exc)
+
+    return identifiers
+
+
+def record_post(
+    path: Path,
+    identifier: str,
+    article: Dict[str, str],
+    summary: str,
+    tweet: str,
+    hashtags: str,
+    country_label: Optional[str],
+    category_label: Optional[str],
+) -> None:
+    payload = {
+        "identifier": normalise_identifier(identifier),
+        "article_url": article.get("url"),
+        "article_title": article.get("title"),
+        "article_source": article.get("source"),
+        "selected_country": (country_label or ""),
+        "selected_category": (category_label or ""),
+        "summary": summary,
+        "hashtags": hashtags,
+        "tweet": tweet,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fp:
+        fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def normalise_identifier(text: str) -> str:
+    return " ".join(text.lower().strip().split())
+
+
+def compose_tweet(summary: str, url: Optional[str], hashtags: str) -> str:
+    parts = [summary]
+    if url:
+        parts.append(url)
+    if hashtags:
+        parts.append(hashtags)
+    return "\n\n".join(parts)
+
+
+def infer_category_from_article(article: Dict[str, str]) -> Optional[str]:
+    text = " ".join(
+        filter(
+            None,
+            [
+                article.get("title"),
+                article.get("description"),
+                article.get("content"),
+            ],
+        )
+    ).lower()
+
+    for category, keywords in KEYWORD_HINTS.items():
+        if any(keyword in text for keyword in keywords):
+            return category
+    return None
+
+
+def build_hashtags(
+    category_label: Optional[str],
+    country_label: Optional[str],
+    article: Dict[str, str],
+) -> str:
+    inferred_category = infer_category_from_article(article)
+    candidate_category = (category_label or inferred_category or "").lower()
+    tags = CATEGORY_HASHTAGS.get(candidate_category, DEFAULT_HASHTAGS)
+
+    country_key = (country_label or "").lower()
+    country_tag = COUNTRY_HASHTAGS.get(country_key)
+
+    ordered_unique_tags: List[str] = []
+    for tag in tags:
+        if tag not in ordered_unique_tags:
+            ordered_unique_tags.append(tag)
+    if country_tag and country_tag not in ordered_unique_tags:
+        ordered_unique_tags.append(country_tag)
+
+    return " ".join(ordered_unique_tags[:3])
+
+
+def fetch_top_articles(
+    api_key: str,
+    country: Optional[str],
+    category: Optional[str],
+    language: Optional[str],
+    page_size: int = 10,
+) -> List[Dict[str, str]]:
+    params: Dict[str, str] = {"apiKey": api_key, "pageSize": str(page_size)}
+    desc_parts: List[str] = []
+
+    if country:
+        params["country"] = country
+        desc_parts.append(f"country={country}")
+    if category:
+        params["category"] = category
+        desc_parts.append(f"category={category}")
+    if language and not country:
+        params["language"] = language
+        desc_parts.append(f"language={language}")
+
+    if not desc_parts:
+        desc_parts.append("global")
+
+    logging.info("Fetching top news articles (%s)...", ", ".join(desc_parts))
+    response = requests.get(NEWS_API_ENDPOINT, params=params, timeout=10)
+    response.raise_for_status()
+    payload = response.json()
+
+    if payload.get("status") != "ok":
+        raise RuntimeError(f"News API error: {payload}")
+
+    articles: List[Dict[str, str]] = []
+    for raw_article in payload.get("articles", []):
+        url = raw_article.get("url")
+        title = raw_article.get("title")
+        description = raw_article.get("description") or ""
+        source = (raw_article.get("source") or {}).get("name")
+
+        if not url or not title:
+            continue
+
+        articles.append(
+            {
+                "url": url,
+                "title": title,
+                "description": description,
+                "content": raw_article.get("content") or "",
+                "source": source or "",
+            }
+        )
+
+    if not articles:
+        raise RuntimeError("News API returned no usable articles.")
+
+    return articles
+
+
+def pick_unseen_article(
+    articles: Iterable[Dict[str, str]],
+    seen_identifiers: Set[str],
+) -> Dict[str, str]:
+    for article in articles:
+        identifier = normalise_identifier(article.get("url") or article.get("title", ""))
+        if identifier not in seen_identifiers:
+            return article
+    raise RuntimeError("No new articles available to post.")
+
+
+def summarise_article(
+    client: OpenAI,
+    model: str,
+    article: Dict[str, str],
+    category_label: Optional[str],
+    country_label: Optional[str],
+) -> Tuple[str, str, str]:
+    for attempt, char_limit in enumerate(SUMMARY_CHAR_LIMITS[:MAX_SUMMARY_ATTEMPTS], start=1):
+        logging.info(
+            "Summarising article (attempt %s/%s, limit %s chars)...",
+            attempt,
+            MAX_SUMMARY_ATTEMPTS,
+            char_limit,
+        )
+        prompt = (
+            "Summarise the news article below in a single sentence, no more than "
+            f"{char_limit} characters. Highlight the key development, mention location or actors "
+            "when clear, keep a neutral tone, and do not add hashtags or quotes."
+        )
+        context = (
+            f"Title: {article['title']}\n"
+            f"Description: {article['description']}\n"
+            f"Content: {article['content']}\n"
+            f"Source: {article['source']}\n"
+            f"URL: {article['url']}"
+        )
+
+        response = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "system",
+                    "content": "You are an assistant who drafts concise, factual news summaries.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"{prompt}\n\n{context}",
+                        }
+                    ],
+                },
+            ],
+        )
+
+        summary = extract_text_from_response(response).strip()
+        if not summary:
+            logging.warning("Empty summary from OpenAI; retrying...")
+            continue
+
+        hashtags = build_hashtags(category_label, country_label, article)
+        tweet_text = compose_tweet(summary, article.get("url"), hashtags)
+        if len(tweet_text) <= MAX_TWEET_LENGTH:
+            return summary, tweet_text, hashtags
+
+        logging.warning(
+            "Summary too long once formatted (%s chars); retrying with tighter limit...",
+            len(tweet_text),
+        )
+
+    raise RuntimeError("Unable to generate a suitably concise summary for the article.")
+
+
+def extract_text_from_response(response) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    try:
+        return response.output[0].content[0].text  # type: ignore[return-value]
+    except (AttributeError, IndexError, KeyError, TypeError):
+        logging.error("Unexpected response format from OpenAI: %s", response)
+        return ""
+
+
+def post_to_twitter(client: tweepy.Client, tweet_text: str) -> None:
+    logging.info("Posting news summary to Twitter...")
+    client.create_tweet(text=tweet_text)
+    logging.info("Tweet posted successfully.")
+
+
+def build_openai_client() -> Tuple[OpenAI, str]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required.")
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    return OpenAI(api_key=api_key), model
+
+
+def build_twitter_client() -> tweepy.Client:
+    required_vars = [
+        "TWITTER_API_KEY",
+        "TWITTER_API_SECRET",
+        "TWITTER_ACCESS_TOKEN",
+        "TWITTER_ACCESS_TOKEN_SECRET",
+    ]
+    missing = [var for var in required_vars if not os.getenv(var)]
+    if missing:
+        raise RuntimeError(f"Missing Twitter credentials: {', '.join(missing)}")
+
+    return tweepy.Client(
+        consumer_key=os.getenv("TWITTER_API_KEY"),
+        consumer_secret=os.getenv("TWITTER_API_SECRET"),
+        access_token=os.getenv("TWITTER_ACCESS_TOKEN"),
+        access_token_secret=os.getenv("TWITTER_ACCESS_TOKEN_SECRET"),
+    )
+
+
+def parse_csv_env(name: str) -> List[str]:
+    value = os.getenv(name, "")
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def dedupe_preserve_order(items: Iterable[Tuple[Optional[str], Optional[str]]]) -> List[Tuple[Optional[str], Optional[str]]]:
+    seen: Set[Tuple[Optional[str], Optional[str]]] = set()
+    ordered: List[Tuple[Optional[str], Optional[str]]] = []
+    for code, label in items:
+        key = (code.lower() if isinstance(code, str) else code, label.lower() if isinstance(label, str) else label)
+        if key not in seen:
+            seen.add(key)
+            ordered.append((code, label))
+    return ordered
+
+
+def expand_country_tokens(tokens: List[str]) -> List[Tuple[Optional[str], Optional[str]]]:
+    if not tokens:
+        return []
+
+    expanded: List[Tuple[Optional[str], Optional[str]]] = []
+    for token in tokens:
+        lower = token.lower()
+        if lower in REGION_COUNTRY_MAP:
+            for code in REGION_COUNTRY_MAP[lower]:
+                expanded.append((code, lower))
+        elif lower in VALID_NEWSAPI_COUNTRIES:
+            expanded.append((lower, lower))
+        else:
+            logging.warning("Ignoring unsupported country token '%s'", token)
+    return dedupe_preserve_order(expanded)
+
+
+def canonicalise_categories(tokens: List[str]) -> List[Tuple[Optional[str], Optional[str]]]:
+    if not tokens:
+        return []
+
+    options: List[Tuple[Optional[str], Optional[str]]] = []
+    for token in tokens:
+        lower = token.lower()
+        if lower in CATEGORY_ALIAS_MAP:
+            options.append(CATEGORY_ALIAS_MAP[lower])
+        elif lower in NEWSAPI_CATEGORIES:
+            options.append((lower, lower))
+        else:
+            logging.warning("Ignoring unsupported category token '%s'", token)
+    return dedupe_preserve_order(options)
+
+
+def load_news_configuration() -> Dict[str, object]:
+    api_key = os.getenv("NEWSAPI_KEY")
+    if not api_key:
+        raise RuntimeError("NEWSAPI_KEY is required to fetch headlines.")
+
+    country_tokens = parse_csv_env("NEWS_COUNTRY")
+    category_tokens = parse_csv_env("NEWS_CATEGORY")
+
+    expanded_countries = expand_country_tokens(country_tokens)
+    canonical_categories = canonicalise_categories(category_tokens)
+    language = os.getenv("NEWS_LANGUAGE") or "en"
+
+    return {
+        "api_key": api_key,
+        "countries": expanded_countries,
+        "categories": canonical_categories,
+        "language": language,
+    }
+
+
+def select_article(
+    news_config: Dict[str, object],
+    page_size: int,
+    seen_identifiers: Set[str],
+) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
+    api_key: str = news_config["api_key"]  # type: ignore[assignment]
+    country_options: List[Tuple[Optional[str], Optional[str]]] = news_config["countries"]  # type: ignore[assignment]
+    category_options: List[Tuple[Optional[str], Optional[str]]] = news_config["categories"]  # type: ignore[assignment]
+    language: Optional[str] = news_config["language"]  # type: ignore[assignment]
+
+    if not country_options:
+        country_options = [(None, None)]
+    if not category_options:
+        category_options = [(None, None)]
+
+    last_error: Optional[Exception] = None
+
+    for country_code, country_label in country_options:
+        for api_category, category_label in category_options:
+            try:
+                language_param = None if country_code else language
+                articles = fetch_top_articles(
+                    api_key=api_key,
+                    country=country_code,
+                    category=api_category,
+                    language=language_param,
+                    page_size=page_size,
+                )
+            except Exception as exc:  # pragma: no cover - network edge cases
+                logging.warning(
+                    "Failed to fetch articles for country=%s category=%s: %s",
+                    (country_label or country_code or "*"),
+                    (category_label or api_category or "*"),
+                    exc,
+                )
+                last_error = exc
+                continue
+
+            try:
+                article = pick_unseen_article(articles, seen_identifiers)
+                return dict(article), (country_label or country_code), category_label
+            except RuntimeError as exc:
+                logging.info(
+                    "No unseen articles for country=%s category=%s; trying next option...",
+                    (country_label or country_code or "*"),
+                    (category_label or api_category or "*"),
+                )
+                last_error = exc
+
+    raise last_error or RuntimeError("No suitable article found across configured countries/categories.")
+
+
+def run_once(
+    history_path: Path,
+    openai_client: OpenAI,
+    openai_model: str,
+    twitter_client: tweepy.Client,
+    news_config: Dict[str, object],
+    page_size: int,
+) -> None:
+    seen_identifiers = load_history(history_path)
+    article, country_label, category_label = select_article(news_config, page_size, seen_identifiers)
+    identifier = article.get("url") or article.get("title")
+    if not identifier:
+        raise RuntimeError("Selected article lacks identifying information.")
+
+    summary, tweet_text, hashtags = summarise_article(
+        openai_client,
+        openai_model,
+        article,
+        category_label,
+        country_label,
+    )
+    post_to_twitter(twitter_client, tweet_text)
+    record_post(
+        history_path,
+        identifier,
+        article,
+        summary,
+        tweet_text,
+        hashtags,
+        country_label,
+        category_label,
+    )
+
+
+def main() -> None:
+    configure_logging()
+    load_dotenv()
+
+    parser = argparse.ArgumentParser(description="Post summarised top news to Twitter.")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Fetch, summarise, and post a single news story, then exit.",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=DEFAULT_INTERVAL_SECONDS,
+        help="Interval between posts in seconds (default: 30 minutes).",
+    )
+    parser.add_argument(
+        "--history",
+        type=Path,
+        default=Path(os.getenv("FACT_STORAGE_PATH", DEFAULT_HISTORY_PATH)),
+        help="Path to the history file used for deduplication.",
+    )
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=10,
+        help="Number of articles to fetch per query (default: 10).",
+    )
+    args = parser.parse_args()
+
+    openai_client, openai_model = build_openai_client()
+    twitter_client = build_twitter_client()
+
+    news_config = load_news_configuration()
+
+    if args.once:
+        run_once(args.history, openai_client, openai_model, twitter_client, news_config, args.page_size)
+        return
+
+    logging.info("Starting continuous news poster with interval %s seconds.", args.interval)
+    while True:
+        try:
+            run_once(
+                args.history,
+                openai_client,
+                openai_model,
+                twitter_client,
+                news_config,
+                args.page_size,
+            )
+        except Exception as exc:  # pragma: no cover - runtime resilience
+            logging.exception("Failed to post news update: %s", exc)
+        logging.info("Sleeping for %s seconds...", args.interval)
+        time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    main()
