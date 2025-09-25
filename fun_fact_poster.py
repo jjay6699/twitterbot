@@ -301,6 +301,45 @@ def prepare_tweet(summary: str, url: Optional[str], hashtags: str) -> Tuple[str,
     fallback_tweet = compose_tweet(fallback_summary, None, "")
     return fallback_summary, "", fallback_tweet
 
+def compute_rate_limit_delay(error: tweepy.errors.TooManyRequests) -> Optional[int]:
+    response = getattr(error, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+
+    retry_after = headers.get("retry-after") or headers.get("Retry-After")
+    if retry_after:
+        try:
+            delay = int(float(retry_after))
+            if delay >= 0:
+                return delay
+        except (TypeError, ValueError):
+            pass
+
+    reset_header = headers.get("x-rate-limit-reset") or headers.get("X-Rate-Limit-Reset")
+    if reset_header:
+        try:
+            reset_at = int(float(reset_header))
+        except (TypeError, ValueError):
+            reset_at = None
+        if reset_at:
+            delay = reset_at - int(time.time())
+            if delay > 0:
+                return delay
+    return None
+
+def get_rate_limit_backoff_seconds() -> int:
+    default_value = 15 * 60
+    env_value = os.getenv("TWITTER_RATE_LIMIT_BACKOFF")
+    if not env_value:
+        return default_value
+    try:
+        parsed = int(env_value)
+    except ValueError:
+        logging.warning("Invalid TWITTER_RATE_LIMIT_BACKOFF value '%s'; using default %s", env_value, default_value)
+        return default_value
+    return max(1, parsed)
+
 def infer_category_from_article(article: Dict[str, str]) -> Optional[str]:
     text = " ".join(
         filter(
@@ -491,9 +530,27 @@ def extract_text_from_response(response) -> str:
 
 def post_to_twitter(client: tweepy.Client, tweet_text: str) -> None:
     logging.info("Posting news summary to Twitter...")
-    client.create_tweet(text=tweet_text)
-    logging.info("Tweet posted successfully.")
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            client.create_tweet(text=tweet_text)
+        except tweepy.errors.TooManyRequests as error:
+            delay = compute_rate_limit_delay(error) or get_rate_limit_backoff_seconds()
+            logging.warning(
+                "Twitter rate limit hit (attempt %s/%s); sleeping %s seconds before retry.",
+                attempt,
+                max_attempts,
+                delay,
+            )
+            time.sleep(delay)
+            continue
+        except tweepy.TweepyException:
+            logging.exception("Twitter API error when posting tweet.")
+            raise
+        logging.info("Tweet posted successfully.")
+        return
 
+    raise RuntimeError("Unable to post tweet after handling rate limits.")
 
 def build_openai_client() -> Tuple[OpenAI, str]:
     api_key = os.getenv("OPENAI_API_KEY")
