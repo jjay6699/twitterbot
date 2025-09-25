@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -21,6 +21,10 @@ MAX_SUMMARY_ATTEMPTS = len(SUMMARY_CHAR_LIMITS)
 MAX_TWEET_LENGTH = 280
 NEWS_API_ENDPOINT = "https://newsapi.org/v2/top-headlines"
 DEFAULT_HISTORY_PATH = "news_post_history.jsonl"
+TWITTER_DAILY_TWEET_LIMIT_DEFAULT = 17
+DAILY_TWEET_WINDOW = timedelta(hours=24)
+
+
 VALID_NEWSAPI_COUNTRIES = {
     "ae", "ar", "at", "au", "be", "bg", "br", "ca", "ch", "cn", "co", "cu",
     "cz", "de", "eg", "fr", "gb", "gr", "hk", "hu", "id", "ie", "il", "in",
@@ -215,6 +219,52 @@ def record_post(
     with path.open("a", encoding="utf-8") as fp:
         fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
+
+def parse_history_timestamp(raw_value: str) -> Optional[datetime]:
+    if not raw_value:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(raw_value)
+    except ValueError:
+        if raw_value.endswith("Z"):
+            try:
+                timestamp = datetime.fromisoformat(f"{raw_value[:-1]}+00:00")
+            except ValueError:
+                logging.warning("Unable to parse history timestamp '%s'", raw_value)
+                return None
+        else:
+            logging.warning("Unable to parse history timestamp '%s'", raw_value)
+            return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=timezone.utc)
+    else:
+        timestamp = timestamp.astimezone(timezone.utc)
+    return timestamp
+
+def recent_post_stats(path: Path, window: timedelta) -> Tuple[int, Optional[datetime]]:
+    if not path.exists():
+        return 0, None
+    cutoff = datetime.now(timezone.utc) - window
+    count = 0
+    earliest_within: Optional[datetime] = None
+    try:
+        with path.open("r", encoding="utf-8") as fp:
+            for line in fp:
+                if not line.strip():
+                    continue
+                try:
+                    entry = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                created_at = parse_history_timestamp(str(entry.get("created_at", "")))
+                if not created_at or created_at < cutoff:
+                    continue
+                count += 1
+                if earliest_within is None or created_at < earliest_within:
+                    earliest_within = created_at
+    except OSError as exc:
+        logging.warning("Failed to read history %s: %s", path, exc)
+    return count, earliest_within
 
 def normalise_identifier(text: str) -> str:
     return " ".join(text.lower().strip().split())
@@ -709,6 +759,52 @@ def run_once(
     news_config: Dict[str, object],
     page_size: int,
 ) -> None:
+    daily_limit_raw = os.getenv("TWITTER_DAILY_TWEET_LIMIT")
+    try:
+        daily_limit = int(daily_limit_raw) if daily_limit_raw else TWITTER_DAILY_TWEET_LIMIT_DEFAULT
+    except ValueError:
+        logging.warning(
+            "Invalid TWITTER_DAILY_TWEET_LIMIT value %r; using default %s",
+            daily_limit_raw,
+            TWITTER_DAILY_TWEET_LIMIT_DEFAULT,
+        )
+        daily_limit = TWITTER_DAILY_TWEET_LIMIT_DEFAULT
+
+    recent_count, earliest_within_window = recent_post_stats(history_path, DAILY_TWEET_WINDOW)
+    if daily_limit > 0 and recent_count >= daily_limit:
+        next_slot = (
+            earliest_within_window + DAILY_TWEET_WINDOW
+            if earliest_within_window is not None
+            else None
+        )
+        if next_slot:
+            wait_seconds = max(0, int((next_slot - datetime.now(timezone.utc)).total_seconds()))
+            if wait_seconds <= 0:
+                logging.info(
+                    "Daily tweet limit reached (%s/%s). Next slot opens momentarily; skipping this interval.",
+                    recent_count,
+                    daily_limit,
+                )
+            else:
+                if wait_seconds >= 60:
+                    human_delay = f"~{((wait_seconds + 59) // 60)} minute(s)"
+                else:
+                    human_delay = f"~{wait_seconds} second(s)"
+                logging.info(
+                    "Daily tweet limit reached (%s/%s). Next slot opens at %s UTC (%s).",
+                    recent_count,
+                    daily_limit,
+                    next_slot.isoformat(timespec="seconds"),
+                    human_delay,
+                )
+        else:
+            logging.info(
+                "Daily tweet limit reached (%s/%s). Skipping this interval.",
+                recent_count,
+                daily_limit,
+            )
+        return
+
     seen_identifiers = load_history(history_path)
     article, country_label, category_label = select_article(news_config, page_size, seen_identifiers)
     identifier = article.get("url") or article.get("title")
