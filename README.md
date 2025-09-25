@@ -44,7 +44,7 @@ This automation polls the latest headlines via NewsAPI, summarises an unseen sto
    ```
 
 ## Continuous Posting
-Run the bot in a long-lived shell (defaults to a 30-minute interval; pass `--interval 60` for quick tests):
+Run the bot in a long-lived shell (defaults to a ~90-minute interval (~16 posts/day); pass `--interval 60` for quick tests):
 ```powershell
 python fun_fact_poster.py
 ```

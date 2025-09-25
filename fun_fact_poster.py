@@ -15,13 +15,13 @@ from openai import OpenAI
 import tweepy
 
 
-DEFAULT_INTERVAL_SECONDS = 30 * 60  # 30 minutes
+DEFAULT_INTERVAL_SECONDS = 24 * 60 * 60 // 16  # ~90 minutes for roughly 16 posts per day
 SUMMARY_CHAR_LIMITS = [240, 220, 200, 180, 160, 140]
 MAX_SUMMARY_ATTEMPTS = len(SUMMARY_CHAR_LIMITS)
 MAX_TWEET_LENGTH = 280
 NEWS_API_ENDPOINT = "https://newsapi.org/v2/top-headlines"
 DEFAULT_HISTORY_PATH = "news_post_history.jsonl"
-TWITTER_DAILY_TWEET_LIMIT_DEFAULT = 17
+TWITTER_DAILY_TWEET_LIMIT_DEFAULT = 16
 DAILY_TWEET_WINDOW = timedelta(hours=24)
 
 
@@ -282,7 +282,7 @@ def compose_tweet(summary: str, url: Optional[str], hashtags: str) -> str:
     hashtags_text = hashtags.strip()
     if hashtags_text:
         parts.append(hashtags_text)
-    return "\\n\\n".join(parts)
+    return "\n\n".join(parts)
 
 def available_summary_characters(url: Optional[str], hashtags: str) -> int:
     other_parts: List[str] = []
@@ -310,6 +310,8 @@ def truncate_text(text: str, limit: int) -> str:
 
 def prepare_tweet(summary: str, url: Optional[str], hashtags: str) -> Tuple[str, str, str]:
     summary_text = summary.strip()
+    summary_text = summary_text.replace(r"\n", " ")
+    summary_text = " ".join(summary_text.split())
     url_text = (url or "").strip() or None
     hashtags_text = hashtags.strip()
     original_length = len(summary_text)
@@ -845,7 +847,7 @@ def main() -> None:
         "--interval",
         type=int,
         default=DEFAULT_INTERVAL_SECONDS,
-        help="Interval between posts in seconds (default: 30 minutes).",
+        help="Interval between posts in seconds (default: ~90 minutes for ~16 posts/day).",
     )
     parser.add_argument(
         "--history",
