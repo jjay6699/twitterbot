@@ -221,13 +221,85 @@ def normalise_identifier(text: str) -> str:
 
 
 def compose_tweet(summary: str, url: Optional[str], hashtags: str) -> str:
-    parts = [summary]
+    parts: List[str] = []
+    summary_text = summary.strip()
+    if summary_text:
+        parts.append(summary_text)
     if url:
-        parts.append(url)
-    if hashtags:
-        parts.append(hashtags)
-    return "\n\n".join(parts)
+        url_text = url.strip()
+        if url_text:
+            parts.append(url_text)
+    hashtags_text = hashtags.strip()
+    if hashtags_text:
+        parts.append(hashtags_text)
+    return "\\n\\n".join(parts)
 
+def available_summary_characters(url: Optional[str], hashtags: str) -> int:
+    other_parts: List[str] = []
+    if url:
+        url_text = url.strip()
+        if url_text:
+            other_parts.append(url_text)
+    hashtags_text = hashtags.strip()
+    if hashtags_text:
+        other_parts.append(hashtags_text)
+    return max(0, MAX_TWEET_LENGTH - sum(len(part) for part in other_parts) - len(other_parts) * 2)
+
+def truncate_text(text: str, limit: int) -> str:
+    cleaned = text.strip()
+    if limit <= 0:
+        return ""
+    if len(cleaned) <= limit:
+        return cleaned
+    if limit <= 3:
+        return cleaned[:limit]
+    truncated = cleaned[: limit - 3].rstrip()
+    if not truncated:
+        return cleaned[:limit]
+    return f"{truncated}..."
+
+def prepare_tweet(summary: str, url: Optional[str], hashtags: str) -> Tuple[str, str, str]:
+    summary_text = summary.strip()
+    url_text = (url or "").strip() or None
+    hashtags_text = hashtags.strip()
+    original_length = len(summary_text)
+    had_url = bool(url_text)
+    had_hashtags = bool(hashtags_text)
+
+    for drop_hashtags, drop_url in (
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ):
+        current_hashtags = "" if drop_hashtags else hashtags_text
+        current_url = None if drop_url else url_text
+        available = available_summary_characters(current_url, current_hashtags)
+        if available <= 0 and (current_url or current_hashtags):
+            continue
+        if available <= 0:
+            available = MAX_TWEET_LENGTH
+        candidate_summary = truncate_text(summary_text, available)
+        if not candidate_summary:
+            continue
+        tweet_text = compose_tweet(candidate_summary, current_url, current_hashtags)
+        if len(tweet_text) <= MAX_TWEET_LENGTH:
+            if drop_hashtags and had_hashtags:
+                logging.info("Tweet adjusted by removing hashtags to stay within length.")
+            if drop_url and had_url:
+                logging.info("Tweet adjusted by omitting the article URL to stay within length.")
+            if len(candidate_summary) < original_length:
+                logging.info(
+                    "Tweet summary truncated from %s to %s characters to fit.",
+                    original_length,
+                    len(candidate_summary),
+                )
+            return candidate_summary, current_hashtags, tweet_text
+
+    logging.warning("Falling back to summary-only tweet after exhausting length adjustments.")
+    fallback_summary = truncate_text(summary_text, MAX_TWEET_LENGTH)
+    fallback_tweet = compose_tweet(fallback_summary, None, "")
+    return fallback_summary, "", fallback_tweet
 
 def infer_category_from_article(article: Dict[str, str]) -> Optional[str]:
     text = " ".join(
@@ -389,9 +461,13 @@ def summarise_article(
             continue
 
         hashtags = build_hashtags(category_label, country_label, article)
-        tweet_text = compose_tweet(summary, article.get("url"), hashtags)
+        summary_adjusted, hashtags_adjusted, tweet_text = prepare_tweet(
+            summary,
+            article.get("url"),
+            hashtags,
+        )
         if len(tweet_text) <= MAX_TWEET_LENGTH:
-            return summary, tweet_text, hashtags
+            return summary_adjusted, tweet_text, hashtags_adjusted
 
         logging.warning(
             "Summary too long once formatted (%s chars); retrying with tighter limit...",
