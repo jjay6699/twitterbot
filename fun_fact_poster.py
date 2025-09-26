@@ -16,7 +16,7 @@ import tweepy
 
 
 DEFAULT_INTERVAL_SECONDS = 24 * 60 * 60 // 16  # ~90 minutes for roughly 16 posts per day
-SUMMARY_CHAR_LIMITS = [240, 220, 200, 180, 160, 140]
+SUMMARY_CHAR_LIMITS = [260, 240, 220, 200, 180, 160]
 MAX_SUMMARY_ATTEMPTS = len(SUMMARY_CHAR_LIMITS)
 MAX_TWEET_LENGTH = 280
 NEWS_API_ENDPOINT = "https://newsapi.org/v2/top-headlines"
@@ -500,6 +500,7 @@ def pick_unseen_article(
     raise RuntimeError("No new articles available to post.")
 
 
+
 def _parse_json_payload(text: str) -> Optional[Dict[str, object]]:
     if not text:
         return None
@@ -550,9 +551,70 @@ def _generate_summary_payload(
     client: OpenAI,
     model: str,
     article: Dict[str, str],
+    char_limit: int,
+) -> Tuple[str, List[str]]:
+    min_length = max(140, char_limit - 40)
+    if min_length > char_limit:
+        min_length = max(char_limit - 10, 0)
+    prompt = (
+        "Write a two-sentence Twitter update between "
+        f"{min_length} and {char_limit} characters. Highlight the key development, the main actors, and any geographic context. "
+        "Maintain a neutral tone and avoid marketing language. "
+        'Return a JSON object with keys "summary" (string) and "hashtags" (array of 2-3 relevant Twitter hashtags, including their # prefix). '
+        "Do not fabricate details or add URLs."
+    )
+    context = (
+        f"Title: {article['title']}\n"
+        f"Description: {article['description']}\n"
+        f"Content: {article['content']}\n"
+        f"Source: {article['source']}\n"
+        f"URL: {article['url']}"
+    )
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                'role': 'system',
+                'content': 'You are an assistant who drafts factual social media updates for breaking news.',
+            },
+            {
+                'role': 'user',
+                'content': [
+                    {
+                        'type': 'input_text',
+                        'text': f"{prompt}\n\n{context}",
+                    }
+                ],
+            },
+        ],
+    )
+    raw_text = extract_text_from_response(response)
+    data = _parse_json_payload(raw_text)
+    if not data:
+        return '', []
+    summary = str(data.get('summary') or '').strip()
+    hashtags_raw = data.get('hashtags')
+    if isinstance(hashtags_raw, str):
+        hashtags_list = [hashtags_raw]
+    elif isinstance(hashtags_raw, list):
+        hashtags_list = [item for item in hashtags_raw if isinstance(item, str)]
+    else:
+        hashtags_list = []
+    return summary, hashtags_list
+
+
+
+def summarise_article(
+    client: OpenAI,
+    model: str,
+    article: Dict[str, str],
     category_label: Optional[str],
     country_label: Optional[str],
 ) -> Tuple[str, str, str]:
+    fallback_hashtags = _sanitise_hashtags(
+        build_hashtags(category_label, country_label, article).split()
+    )
+
     for attempt, char_limit in enumerate(SUMMARY_CHAR_LIMITS[:MAX_SUMMARY_ATTEMPTS], start=1):
         logging.info(
             "Summarising article (attempt %s/%s, limit %s chars)...",
@@ -560,39 +622,14 @@ def _generate_summary_payload(
             MAX_SUMMARY_ATTEMPTS,
             char_limit,
         )
-        prompt = (
-            "Summarise the news article below in a single sentence, no more than "
-            f"{char_limit} characters. Highlight the key development, mention location or actors "
-            "when clear, keep a neutral tone, and do not add hashtags or quotes."
-        )
-        context = (
-            f"Title: {article['title']}\n"
-            f"Description: {article['description']}\n"
-            f"Content: {article['content']}\n"
-            f"Source: {article['source']}\n"
-            f"URL: {article['url']}"
-        )
 
-        response = client.responses.create(
-            model=model,
-            input=[
-                {
-                    "role": "system",
-                    "content": "You are an assistant who drafts concise, factual news summaries.",
-                },
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "input_text",
-                            "text": f"{prompt}\n\n{context}",
-                        }
-                    ],
-                },
-            ],
+        summary, raw_hashtags = _generate_summary_payload(
+            client,
+            model,
+            article,
+            char_limit,
         )
-
-        summary = extract_text_from_response(response).strip()
+        summary = summary.strip()
         if not summary:
             logging.warning("Empty summary from OpenAI; retrying...")
             continue
@@ -625,191 +662,6 @@ def _generate_summary_payload(
 
     raise RuntimeError("Unable to generate a suitably concise summary for the article.")
 
-
-
-def extract_text_from_response(response) -> str:
-    output_text = getattr(response, "output_text", None)
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text
-
-    try:
-        return response.output[0].content[0].text  # type: ignore[return-value]
-    except (AttributeError, IndexError, KeyError, TypeError):
-        logging.error("Unexpected response format from OpenAI: %s", response)
-        return ""
-
-
-def post_to_twitter(client: tweepy.Client, tweet_text: str) -> None:
-    logging.info("Posting news summary to Twitter...")
-    max_attempts = 3
-    for attempt in range(1, max_attempts + 1):
-        try:
-            client.create_tweet(text=tweet_text)
-        except tweepy.errors.TooManyRequests as error:
-            delay = compute_rate_limit_delay(error) or get_rate_limit_backoff_seconds()
-            logging.warning(
-                "Twitter rate limit hit (attempt %s/%s); sleeping %s seconds before retry.",
-                attempt,
-                max_attempts,
-                delay,
-            )
-            time.sleep(delay)
-            continue
-        except tweepy.TweepyException:
-            logging.exception("Twitter API error when posting tweet.")
-            raise
-        logging.info("Tweet posted successfully.")
-        return
-
-    raise RuntimeError("Unable to post tweet after handling rate limits.")
-
-def build_openai_client() -> Tuple[OpenAI, str]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is required.")
-
-    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-    return OpenAI(api_key=api_key), model
-
-
-def build_twitter_client() -> tweepy.Client:
-    required_vars = [
-        "TWITTER_API_KEY",
-        "TWITTER_API_SECRET",
-        "TWITTER_ACCESS_TOKEN",
-        "TWITTER_ACCESS_TOKEN_SECRET",
-    ]
-    missing = [var for var in required_vars if not os.getenv(var)]
-    if missing:
-        raise RuntimeError(f"Missing Twitter credentials: {', '.join(missing)}")
-
-    return tweepy.Client(
-        consumer_key=os.getenv("TWITTER_API_KEY"),
-        consumer_secret=os.getenv("TWITTER_API_SECRET"),
-        access_token=os.getenv("TWITTER_ACCESS_TOKEN"),
-        access_token_secret=os.getenv("TWITTER_ACCESS_TOKEN_SECRET"),
-    )
-
-
-def parse_csv_env(name: str) -> List[str]:
-    value = os.getenv(name, "")
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
-def dedupe_preserve_order(items: Iterable[Tuple[Optional[str], Optional[str]]]) -> List[Tuple[Optional[str], Optional[str]]]:
-    seen: Set[Tuple[Optional[str], Optional[str]]] = set()
-    ordered: List[Tuple[Optional[str], Optional[str]]] = []
-    for code, label in items:
-        key = (code.lower() if isinstance(code, str) else code, label.lower() if isinstance(label, str) else label)
-        if key not in seen:
-            seen.add(key)
-            ordered.append((code, label))
-    return ordered
-
-
-def expand_country_tokens(tokens: List[str]) -> List[Tuple[Optional[str], Optional[str]]]:
-    if not tokens:
-        return []
-
-    expanded: List[Tuple[Optional[str], Optional[str]]] = []
-    for token in tokens:
-        lower = token.lower()
-        if lower in REGION_COUNTRY_MAP:
-            for code in REGION_COUNTRY_MAP[lower]:
-                expanded.append((code, lower))
-        elif lower in VALID_NEWSAPI_COUNTRIES:
-            expanded.append((lower, lower))
-        else:
-            logging.warning("Ignoring unsupported country token '%s'", token)
-    return dedupe_preserve_order(expanded)
-
-
-def canonicalise_categories(tokens: List[str]) -> List[Tuple[Optional[str], Optional[str]]]:
-    if not tokens:
-        return []
-
-    options: List[Tuple[Optional[str], Optional[str]]] = []
-    for token in tokens:
-        lower = token.lower()
-        if lower in CATEGORY_ALIAS_MAP:
-            options.append(CATEGORY_ALIAS_MAP[lower])
-        elif lower in NEWSAPI_CATEGORIES:
-            options.append((lower, lower))
-        else:
-            logging.warning("Ignoring unsupported category token '%s'", token)
-    return dedupe_preserve_order(options)
-
-
-def load_news_configuration() -> Dict[str, object]:
-    api_key = os.getenv("NEWSAPI_KEY")
-    if not api_key:
-        raise RuntimeError("NEWSAPI_KEY is required to fetch headlines.")
-
-    country_tokens = parse_csv_env("NEWS_COUNTRY")
-    category_tokens = parse_csv_env("NEWS_CATEGORY")
-
-    expanded_countries = expand_country_tokens(country_tokens)
-    canonical_categories = canonicalise_categories(category_tokens)
-    language = os.getenv("NEWS_LANGUAGE") or "en"
-
-    return {
-        "api_key": api_key,
-        "countries": expanded_countries,
-        "categories": canonical_categories,
-        "language": language,
-    }
-
-
-def select_article(
-    news_config: Dict[str, object],
-    page_size: int,
-    seen_identifiers: Set[str],
-) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
-    api_key: str = news_config["api_key"]  # type: ignore[assignment]
-    country_options: List[Tuple[Optional[str], Optional[str]]] = news_config["countries"]  # type: ignore[assignment]
-    category_options: List[Tuple[Optional[str], Optional[str]]] = news_config["categories"]  # type: ignore[assignment]
-    language: Optional[str] = news_config["language"]  # type: ignore[assignment]
-
-    if not country_options:
-        country_options = [(None, None)]
-    if not category_options:
-        category_options = [(None, None)]
-
-    last_error: Optional[Exception] = None
-
-    for country_code, country_label in country_options:
-        for api_category, category_label in category_options:
-            try:
-                language_param = None if country_code else language
-                articles = fetch_top_articles(
-                    api_key=api_key,
-                    country=country_code,
-                    category=api_category,
-                    language=language_param,
-                    page_size=page_size,
-                )
-            except Exception as exc:  # pragma: no cover - network edge cases
-                logging.warning(
-                    "Failed to fetch articles for country=%s category=%s: %s",
-                    (country_label or country_code or "*"),
-                    (category_label or api_category or "*"),
-                    exc,
-                )
-                last_error = exc
-                continue
-
-            try:
-                article = pick_unseen_article(articles, seen_identifiers)
-                return dict(article), (country_label or country_code), category_label
-            except RuntimeError as exc:
-                logging.info(
-                    "No unseen articles for country=%s category=%s; trying next option...",
-                    (country_label or country_code or "*"),
-                    (category_label or api_category or "*"),
-                )
-                last_error = exc
-
-    raise last_error or RuntimeError("No suitable article found across configured countries/categories.")
 
 
 def run_once(
