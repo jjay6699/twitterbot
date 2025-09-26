@@ -5,7 +5,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
@@ -15,16 +15,12 @@ from openai import OpenAI
 import tweepy
 
 
-DEFAULT_INTERVAL_SECONDS = 24 * 60 * 60 // 16  # ~90 minutes for roughly 16 posts per day
-SUMMARY_CHAR_LIMITS = [250, 230, 210, 190, 170, 150]
+DEFAULT_INTERVAL_SECONDS = 30 * 60  # 30 minutes
+SUMMARY_CHAR_LIMITS = [240, 220, 200, 180, 160, 140]
 MAX_SUMMARY_ATTEMPTS = len(SUMMARY_CHAR_LIMITS)
 MAX_TWEET_LENGTH = 280
 NEWS_API_ENDPOINT = "https://newsapi.org/v2/top-headlines"
 DEFAULT_HISTORY_PATH = "news_post_history.jsonl"
-TWITTER_DAILY_TWEET_LIMIT_DEFAULT = 16
-DAILY_TWEET_WINDOW = timedelta(hours=24)
-
-
 VALID_NEWSAPI_COUNTRIES = {
     "ae", "ar", "at", "au", "be", "bg", "br", "ca", "ch", "cn", "co", "cu",
     "cz", "de", "eg", "fr", "gb", "gr", "hk", "hu", "id", "ie", "il", "in",
@@ -220,52 +216,6 @@ def record_post(
         fp.write(json.dumps(payload, ensure_ascii=False) + "\n")
 
 
-def parse_history_timestamp(raw_value: str) -> Optional[datetime]:
-    if not raw_value:
-        return None
-    try:
-        timestamp = datetime.fromisoformat(raw_value)
-    except ValueError:
-        if raw_value.endswith("Z"):
-            try:
-                timestamp = datetime.fromisoformat(f"{raw_value[:-1]}+00:00")
-            except ValueError:
-                logging.warning("Unable to parse history timestamp '%s'", raw_value)
-                return None
-        else:
-            logging.warning("Unable to parse history timestamp '%s'", raw_value)
-            return None
-    if timestamp.tzinfo is None:
-        timestamp = timestamp.replace(tzinfo=timezone.utc)
-    else:
-        timestamp = timestamp.astimezone(timezone.utc)
-    return timestamp
-
-def recent_post_stats(path: Path, window: timedelta) -> Tuple[int, Optional[datetime]]:
-    if not path.exists():
-        return 0, None
-    cutoff = datetime.now(timezone.utc) - window
-    count = 0
-    earliest_within: Optional[datetime] = None
-    try:
-        with path.open("r", encoding="utf-8") as fp:
-            for line in fp:
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                created_at = parse_history_timestamp(str(entry.get("created_at", "")))
-                if not created_at or created_at < cutoff:
-                    continue
-                count += 1
-                if earliest_within is None or created_at < earliest_within:
-                    earliest_within = created_at
-    except OSError as exc:
-        logging.warning("Failed to read history %s: %s", path, exc)
-    return count, earliest_within
-
 def normalise_identifier(text: str) -> str:
     return " ".join(text.lower().strip().split())
 
@@ -282,7 +232,7 @@ def compose_tweet(summary: str, url: Optional[str], hashtags: str) -> str:
     hashtags_text = hashtags.strip()
     if hashtags_text:
         parts.append(hashtags_text)
-    return "\n\n".join(parts)
+    return "\\n\\n".join(parts)
 
 def available_summary_characters(url: Optional[str], hashtags: str) -> int:
     other_parts: List[str] = []
@@ -310,8 +260,6 @@ def truncate_text(text: str, limit: int) -> str:
 
 def prepare_tweet(summary: str, url: Optional[str], hashtags: str) -> Tuple[str, str, str]:
     summary_text = summary.strip()
-    summary_text = summary_text.replace(r"\n", " ")
-    summary_text = " ".join(summary_text.split())
     url_text = (url or "").strip() or None
     hashtags_text = hashtags.strip()
     original_length = len(summary_text)
@@ -500,106 +448,6 @@ def pick_unseen_article(
     raise RuntimeError("No new articles available to post.")
 
 
-def _parse_json_payload(text: str) -> Optional[Dict[str, object]]:
-    if not text:
-        return None
-    start = text.find('{')
-    end = text.rfind('}')
-    if start == -1 or end == -1 or end < start:
-        logging.warning('OpenAI response missing JSON object: %s', text)
-        return None
-    snippet = text[start : end + 1]
-    try:
-        return json.loads(snippet)
-    except json.JSONDecodeError:
-        logging.warning('Failed to parse JSON from OpenAI response: %s', text)
-        return None
-
-
-def _normalise_hashtag(tag: str) -> Optional[str]:
-    cleaned = tag.strip()
-    if not cleaned:
-        return None
-    cleaned = cleaned.replace(' ', '')
-    if not cleaned:
-        return None
-    if not cleaned.startswith('#'):
-        cleaned = '#' + cleaned.lstrip('#')
-    if len(cleaned) <= 1:
-        return None
-    return cleaned
-
-
-def _sanitise_hashtags(tags: Iterable[str]) -> List[str]:
-    ordered: List[str] = []
-    seen: Set[str] = set()
-    for raw in tags:
-        if not isinstance(raw, str):
-            continue
-        normalised = _normalise_hashtag(raw)
-        if not normalised or normalised.lower() in seen:
-            continue
-        seen.add(normalised.lower())
-        ordered.append(normalised)
-        if len(ordered) >= 3:
-            break
-    return ordered
-
-
-def _generate_summary_payload(
-    client: OpenAI,
-    model: str,
-    article: Dict[str, str],
-    char_limit: int,
-) -> Tuple[str, List[str]]:
-    prompt = (
-        'Craft a factual two-sentence Twitter update no longer than '
-        f'{char_limit} characters. Emphasise what happened, who is involved, '
-        'and any relevant geography. '
-        'Return a JSON object with keys "summary" (string) and "hashtags" (array of 2-3 relevant Twitter hashtags including their # prefix). '
-        'Do not fabricate details or add URLs.'
-    )
-    context = (
-        f"Title: {article['title']}\n"
-        f"Description: {article['description']}\n"
-        f"Content: {article['content']}\n"
-        f"Source: {article['source']}\n"
-        f"URL: {article['url']}"
-    )
-    response = client.responses.create(
-        model=model,
-        input=[
-            {
-                'role': 'system',
-                'content': 'You are an assistant who drafts factual social media updates for breaking news.',
-            },
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'input_text',
-                        'text': f"{prompt}\n\n{context}",
-                    }
-                ],
-            },
-        ],
-    )
-    raw_text = extract_text_from_response(response)
-    data = _parse_json_payload(raw_text)
-    if not data:
-        return '', []
-    summary = str(data.get('summary') or '').strip()
-    hashtags_raw = data.get('hashtags')
-    if isinstance(hashtags_raw, str):
-        hashtags_list = [hashtags_raw]
-    elif isinstance(hashtags_raw, list):
-        hashtags_list = [item for item in hashtags_raw if isinstance(item, str)]
-    else:
-        hashtags_list = []
-    return summary, hashtags_list
-
-
-
 def summarise_article(
     client: OpenAI,
     model: str,
@@ -607,10 +455,6 @@ def summarise_article(
     category_label: Optional[str],
     country_label: Optional[str],
 ) -> Tuple[str, str, str]:
-    fallback_hashtags = _sanitise_hashtags(
-        build_hashtags(category_label, country_label, article).split()
-    )
-
     for attempt, char_limit in enumerate(SUMMARY_CHAR_LIMITS[:MAX_SUMMARY_ATTEMPTS], start=1):
         logging.info(
             "Summarising article (attempt %s/%s, limit %s chars)...",
@@ -618,31 +462,44 @@ def summarise_article(
             MAX_SUMMARY_ATTEMPTS,
             char_limit,
         )
-
-        summary, raw_hashtags = _generate_summary_payload(
-            client,
-            model,
-            article,
-            char_limit,
+        prompt = (
+            "Summarise the news article below in a single sentence, no more than "
+            f"{char_limit} characters. Highlight the key development, mention location or actors "
+            "when clear, keep a neutral tone, and do not add hashtags or quotes."
         )
-        summary = summary.strip()
+        context = (
+            f"Title: {article['title']}\n"
+            f"Description: {article['description']}\n"
+            f"Content: {article['content']}\n"
+            f"Source: {article['source']}\n"
+            f"URL: {article['url']}"
+        )
+
+        response = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "system",
+                    "content": "You are an assistant who drafts concise, factual news summaries.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"{prompt}\n\n{context}",
+                        }
+                    ],
+                },
+            ],
+        )
+
+        summary = extract_text_from_response(response).strip()
         if not summary:
             logging.warning("Empty summary from OpenAI; retrying...")
             continue
 
-        if len(summary) > char_limit:
-            logging.info(
-                "Summary exceeded requested limit (%s > %s); trimming.",
-                len(summary),
-                char_limit,
-            )
-            summary = truncate_text(summary, char_limit)
-
-        hashtags_list = _sanitise_hashtags(raw_hashtags)
-        if not hashtags_list and fallback_hashtags:
-            hashtags_list = list(fallback_hashtags)
-        hashtags = " ".join(hashtags_list)
-
+        hashtags = build_hashtags(category_label, country_label, article)
         summary_adjusted, hashtags_adjusted, tweet_text = prepare_tweet(
             summary,
             article.get("url"),
@@ -657,7 +514,6 @@ def summarise_article(
         )
 
     raise RuntimeError("Unable to generate a suitably concise summary for the article.")
-
 
 
 def extract_text_from_response(response) -> str:
@@ -695,7 +551,6 @@ def post_to_twitter(client: tweepy.Client, tweet_text: str) -> None:
         return
 
     raise RuntimeError("Unable to post tweet after handling rate limits.")
-
 def build_openai_client() -> Tuple[OpenAI, str]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
@@ -853,52 +708,6 @@ def run_once(
     news_config: Dict[str, object],
     page_size: int,
 ) -> None:
-    daily_limit_raw = os.getenv("TWITTER_DAILY_TWEET_LIMIT")
-    try:
-        daily_limit = int(daily_limit_raw) if daily_limit_raw else TWITTER_DAILY_TWEET_LIMIT_DEFAULT
-    except ValueError:
-        logging.warning(
-            "Invalid TWITTER_DAILY_TWEET_LIMIT value %r; using default %s",
-            daily_limit_raw,
-            TWITTER_DAILY_TWEET_LIMIT_DEFAULT,
-        )
-        daily_limit = TWITTER_DAILY_TWEET_LIMIT_DEFAULT
-
-    recent_count, earliest_within_window = recent_post_stats(history_path, DAILY_TWEET_WINDOW)
-    if daily_limit > 0 and recent_count >= daily_limit:
-        next_slot = (
-            earliest_within_window + DAILY_TWEET_WINDOW
-            if earliest_within_window is not None
-            else None
-        )
-        if next_slot:
-            wait_seconds = max(0, int((next_slot - datetime.now(timezone.utc)).total_seconds()))
-            if wait_seconds <= 0:
-                logging.info(
-                    "Daily tweet limit reached (%s/%s). Next slot opens momentarily; skipping this interval.",
-                    recent_count,
-                    daily_limit,
-                )
-            else:
-                if wait_seconds >= 60:
-                    human_delay = f"~{((wait_seconds + 59) // 60)} minute(s)"
-                else:
-                    human_delay = f"~{wait_seconds} second(s)"
-                logging.info(
-                    "Daily tweet limit reached (%s/%s). Next slot opens at %s UTC (%s).",
-                    recent_count,
-                    daily_limit,
-                    next_slot.isoformat(timespec="seconds"),
-                    human_delay,
-                )
-        else:
-            logging.info(
-                "Daily tweet limit reached (%s/%s). Skipping this interval.",
-                recent_count,
-                daily_limit,
-            )
-        return
-
     seen_identifiers = load_history(history_path)
     article, country_label, category_label = select_article(news_config, page_size, seen_identifiers)
     identifier = article.get("url") or article.get("title")
@@ -939,7 +748,7 @@ def main() -> None:
         "--interval",
         type=int,
         default=DEFAULT_INTERVAL_SECONDS,
-        help="Interval between posts in seconds (default: ~90 minutes for ~16 posts/day).",
+        help="Interval between posts in seconds (default: 30 minutes).",
     )
     parser.add_argument(
         "--history",
