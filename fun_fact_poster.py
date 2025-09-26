@@ -392,6 +392,18 @@ def get_rate_limit_backoff_seconds() -> int:
         return default_value
     return max(1, parsed)
 
+def extract_text_from_response(response) -> str:
+    output_text = getattr(response, 'output_text', None)
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text
+
+    try:
+        return response.output[0].content[0].text  # type: ignore[return-value]
+    except (AttributeError, IndexError, KeyError, TypeError):
+        logging.error('Unexpected response format from OpenAI: %s', response)
+        return ''
+
+
 def post_to_twitter(client: tweepy.Client, tweet_text: str) -> None:
     logging.info("Posting news summary to Twitter...")
     max_attempts = 3
