@@ -392,6 +392,179 @@ def get_rate_limit_backoff_seconds() -> int:
         return default_value
     return max(1, parsed)
 
+def post_to_twitter(client: tweepy.Client, tweet_text: str) -> None:
+    logging.info("Posting news summary to Twitter...")
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            client.create_tweet(text=tweet_text)
+        except tweepy.errors.TooManyRequests as error:
+            delay = compute_rate_limit_delay(error) or get_rate_limit_backoff_seconds()
+            logging.warning(
+                "Twitter rate limit hit (attempt %s/%s); sleeping %s seconds before retry.",
+                attempt,
+                max_attempts,
+                delay,
+            )
+            time.sleep(delay)
+            continue
+        except tweepy.TweepyException:
+            logging.exception("Twitter API error when posting tweet.")
+            raise
+        logging.info("Tweet posted successfully.")
+        return
+
+    raise RuntimeError("Unable to post tweet after handling rate limits.")
+
+
+def build_openai_client() -> Tuple[OpenAI, str]:
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is required.")
+
+    model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+    return OpenAI(api_key=api_key), model
+
+
+def build_twitter_client() -> tweepy.Client:
+    required_vars = [
+        "TWITTER_API_KEY",
+        "TWITTER_API_SECRET",
+        "TWITTER_ACCESS_TOKEN",
+        "TWITTER_ACCESS_TOKEN_SECRET",
+    ]
+    missing = [var for var in required_vars if not os.getenv(var)]
+    if missing:
+        raise RuntimeError(f"Missing Twitter credentials: {', '.join(missing)}")
+
+    return tweepy.Client(
+        consumer_key=os.getenv("TWITTER_API_KEY"),
+        consumer_secret=os.getenv("TWITTER_API_SECRET"),
+        access_token=os.getenv("TWITTER_ACCESS_TOKEN"),
+        access_token_secret=os.getenv("TWITTER_ACCESS_TOKEN_SECRET"),
+    )
+
+
+def parse_csv_env(name: str) -> List[str]:
+    value = os.getenv(name, "")
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def dedupe_preserve_order(items: Iterable[Tuple[Optional[str], Optional[str]]]) -> List[Tuple[Optional[str], Optional[str]]]:
+    seen: Set[Tuple[Optional[str], Optional[str]]] = set()
+    ordered: List[Tuple[Optional[str], Optional[str]]] = []
+    for code, label in items:
+        key = (code.lower() if isinstance(code, str) else code, label.lower() if isinstance(label, str) else label)
+        if key not in seen:
+            seen.add(key)
+            ordered.append((code, label))
+    return ordered
+
+
+def expand_country_tokens(tokens: List[str]) -> List[Tuple[Optional[str], Optional[str]]]:
+    if not tokens:
+        return []
+
+    expanded: List[Tuple[Optional[str], Optional[str]]] = []
+    for token in tokens:
+        lower = token.lower()
+        if lower in REGION_COUNTRY_MAP:
+            for code in REGION_COUNTRY_MAP[lower]:
+                expanded.append((code, lower))
+        elif lower in VALID_NEWSAPI_COUNTRIES:
+            expanded.append((lower, lower))
+        else:
+            logging.warning("Ignoring unsupported country token '%s'", token)
+    return dedupe_preserve_order(expanded)
+
+
+def canonicalise_categories(tokens: List[str]) -> List[Tuple[Optional[str], Optional[str]]]:
+    if not tokens:
+        return []
+
+    options: List[Tuple[Optional[str], Optional[str]]] = []
+    for token in tokens:
+        lower = token.lower()
+        if lower in CATEGORY_ALIAS_MAP:
+            options.append(CATEGORY_ALIAS_MAP[lower])
+        elif lower in NEWSAPI_CATEGORIES:
+            options.append((lower, lower))
+        else:
+            logging.warning("Ignoring unsupported category token '%s'", token)
+    return dedupe_preserve_order(options)
+
+
+def load_news_configuration() -> Dict[str, object]:
+    api_key = os.getenv("NEWSAPI_KEY")
+    if not api_key:
+        raise RuntimeError("NEWSAPI_KEY is required to fetch headlines.")
+
+    country_tokens = parse_csv_env("NEWS_COUNTRY")
+    category_tokens = parse_csv_env("NEWS_CATEGORY")
+
+    expanded_countries = expand_country_tokens(country_tokens)
+    canonical_categories = canonicalise_categories(category_tokens)
+    language = os.getenv("NEWS_LANGUAGE") or "en"
+
+    return {
+        "api_key": api_key,
+        "countries": expanded_countries,
+        "categories": canonical_categories,
+        "language": language,
+    }
+
+
+def select_article(
+    news_config: Dict[str, object],
+    page_size: int,
+    seen_identifiers: Set[str],
+) -> Tuple[Dict[str, str], Optional[str], Optional[str]]:
+    api_key: str = news_config["api_key"]  # type: ignore[assignment]
+    country_options: List[Tuple[Optional[str], Optional[str]]] = news_config["countries"]  # type: ignore[assignment]
+    category_options: List[Tuple[Optional[str], Optional[str]]] = news_config["categories"]  # type: ignore[assignment]
+    language: Optional[str] = news_config["language"]  # type: ignore[assignment]
+
+    if not country_options:
+        country_options = [(None, None)]
+    if not category_options:
+        category_options = [(None, None)]
+
+    last_error: Optional[Exception] = None
+
+    for country_code, country_label in country_options:
+        for api_category, category_label in category_options:
+            try:
+                language_param = None if country_code else language
+                articles = fetch_top_articles(
+                    api_key=api_key,
+                    country=country_code,
+                    category=api_category,
+                    language=language_param,
+                    page_size=page_size,
+                )
+            except Exception as exc:  # pragma: no cover - network edge cases
+                logging.warning(
+                    "Failed to fetch articles for country=%s category=%s: %s",
+                    (country_label or country_code or "*"),
+                    (category_label or api_category or "*"),
+                    exc,
+                )
+                last_error = exc
+                continue
+
+            try:
+                article = pick_unseen_article(articles, seen_identifiers)
+                return dict(article), (country_label or country_code), category_label
+            except RuntimeError as exc:
+                logging.info(
+                    "No unseen articles for country=%s category=%s; trying next option...",
+                    (country_label or country_code or "*"),
+                    (category_label or api_category or "*"),
+                )
+                last_error = exc
+
+    raise last_error or RuntimeError("No suitable article found across configured countries/categories.")
+
 def infer_category_from_article(article: Dict[str, str]) -> Optional[str]:
     text = " ".join(
         filter(
