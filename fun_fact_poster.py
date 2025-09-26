@@ -16,7 +16,7 @@ import tweepy
 
 
 DEFAULT_INTERVAL_SECONDS = 24 * 60 * 60 // 16  # ~90 minutes for roughly 16 posts per day
-SUMMARY_CHAR_LIMITS = [250, 230, 210, 190, 170, 150]
+SUMMARY_CHAR_LIMITS = [240, 220, 200, 180, 160, 140]
 MAX_SUMMARY_ATTEMPTS = len(SUMMARY_CHAR_LIMITS)
 MAX_TWEET_LENGTH = 280
 NEWS_API_ENDPOINT = "https://newsapi.org/v2/top-headlines"
@@ -550,67 +550,9 @@ def _generate_summary_payload(
     client: OpenAI,
     model: str,
     article: Dict[str, str],
-    char_limit: int,
-) -> Tuple[str, List[str]]:
-    prompt = (
-        'Craft a factual two-sentence Twitter update no longer than '
-        f'{char_limit} characters. Emphasise what happened, who is involved, '
-        'and any relevant geography. '
-        'Return a JSON object with keys "summary" (string) and "hashtags" (array of 2-3 relevant Twitter hashtags including their # prefix). '
-        'Do not fabricate details or add URLs.'
-    )
-    context = (
-        f"Title: {article['title']}\n"
-        f"Description: {article['description']}\n"
-        f"Content: {article['content']}\n"
-        f"Source: {article['source']}\n"
-        f"URL: {article['url']}"
-    )
-    response = client.responses.create(
-        model=model,
-        input=[
-            {
-                'role': 'system',
-                'content': 'You are an assistant who drafts factual social media updates for breaking news.',
-            },
-            {
-                'role': 'user',
-                'content': [
-                    {
-                        'type': 'input_text',
-                        'text': f"{prompt}\n\n{context}",
-                    }
-                ],
-            },
-        ],
-    )
-    raw_text = extract_text_from_response(response)
-    data = _parse_json_payload(raw_text)
-    if not data:
-        return '', []
-    summary = str(data.get('summary') or '').strip()
-    hashtags_raw = data.get('hashtags')
-    if isinstance(hashtags_raw, str):
-        hashtags_list = [hashtags_raw]
-    elif isinstance(hashtags_raw, list):
-        hashtags_list = [item for item in hashtags_raw if isinstance(item, str)]
-    else:
-        hashtags_list = []
-    return summary, hashtags_list
-
-
-
-def summarise_article(
-    client: OpenAI,
-    model: str,
-    article: Dict[str, str],
     category_label: Optional[str],
     country_label: Optional[str],
 ) -> Tuple[str, str, str]:
-    fallback_hashtags = _sanitise_hashtags(
-        build_hashtags(category_label, country_label, article).split()
-    )
-
     for attempt, char_limit in enumerate(SUMMARY_CHAR_LIMITS[:MAX_SUMMARY_ATTEMPTS], start=1):
         logging.info(
             "Summarising article (attempt %s/%s, limit %s chars)...",
@@ -618,14 +560,39 @@ def summarise_article(
             MAX_SUMMARY_ATTEMPTS,
             char_limit,
         )
-
-        summary, raw_hashtags = _generate_summary_payload(
-            client,
-            model,
-            article,
-            char_limit,
+        prompt = (
+            "Summarise the news article below in a single sentence, no more than "
+            f"{char_limit} characters. Highlight the key development, mention location or actors "
+            "when clear, keep a neutral tone, and do not add hashtags or quotes."
         )
-        summary = summary.strip()
+        context = (
+            f"Title: {article['title']}\n"
+            f"Description: {article['description']}\n"
+            f"Content: {article['content']}\n"
+            f"Source: {article['source']}\n"
+            f"URL: {article['url']}"
+        )
+
+        response = client.responses.create(
+            model=model,
+            input=[
+                {
+                    "role": "system",
+                    "content": "You are an assistant who drafts concise, factual news summaries.",
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": f"{prompt}\n\n{context}",
+                        }
+                    ],
+                },
+            ],
+        )
+
+        summary = extract_text_from_response(response).strip()
         if not summary:
             logging.warning("Empty summary from OpenAI; retrying...")
             continue
